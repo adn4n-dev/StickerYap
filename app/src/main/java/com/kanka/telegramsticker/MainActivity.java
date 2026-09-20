@@ -24,6 +24,7 @@ import android.widget.Toast;
 import android.widget.VideoView;
 
 import com.arthenica.ffmpegkit.FFmpegKit;
+import com.arthenica.ffmpegkit.FFmpegSession;
 import com.arthenica.ffmpegkit.ReturnCode;
 
 import java.io.File;
@@ -38,9 +39,6 @@ public class MainActivity extends Activity {
     private static final long LIMIT_BYTES = 255_000L;
 
     private Uri selectedUri;
-    private File cachedInput;
-    private File currentOutput;
-
     private VideoView preview;
     private TextView selectedText;
     private TextView status;
@@ -158,6 +156,7 @@ public class MainActivity extends Activity {
             try {
                 getContentResolver().takePersistableUriPermission(selectedUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
             } catch (Exception ignored) {}
+
             selectedText.setText("Video hazır");
             preview.setVideoURI(selectedUri);
             preview.setOnPreparedListener(mp -> {
@@ -171,21 +170,49 @@ public class MainActivity extends Activity {
 
     private void convert() {
         if (selectedUri == null) return;
+
+        // Read every View value on the UI thread before starting work.
+        final Uri uri = selectedUri;
+        final int strength = strengthSpinner.getSelectedItemPosition();
+        final int edge = edgeSeek.getProgress();
+
         convertButton.setEnabled(false);
         progress.setVisibility(View.VISIBLE);
         status.setText("Video hazırlanıyor…");
 
         new Thread(() -> {
+            File input = null;
             try {
-                cachedInput = new File(getCacheDir(), "input_" + System.currentTimeMillis() + ".mp4");
-                copyUriToFile(selectedUri, cachedInput);
-                double duration = readDurationSeconds(cachedInput);
-                runOnUiThread(() -> status.setText("Yeşil temizleniyor ve WebM hazırlanıyor…"));
-                encodeWithSizeTarget(duration);
-            } catch (Exception e) {
-                fail("Hata: " + e.getMessage());
+                input = new File(getCacheDir(), "input_" + System.currentTimeMillis() + ".mp4");
+                copyUriToFile(uri, input);
+                double duration = readDurationSeconds(input);
+
+                uiStatus("FFmpeg motoru kontrol ediliyor…");
+                FFmpegSession check = FFmpegKit.execute("-hide_banner -version");
+                if (!ReturnCode.isSuccess(check.getReturnCode())) {
+                    throw new Exception("FFmpeg başlatılamadı: " + check.getReturnCode());
+                }
+
+                uiStatus("Yeşil temizleniyor ve WebM hazırlanıyor…");
+                File output = encodeWithSizeTarget(input, duration, strength, edge);
+                long size = output.length();
+                Uri saved = saveToDownloads(output);
+
+                runOnUiThread(() -> {
+                    progress.setVisibility(View.GONE);
+                    convertButton.setEnabled(true);
+                    status.setText(String.format(Locale.US, "Hazır: %.1f KB", size / 1024.0));
+                    Toast.makeText(this, "Downloads/StickerYap'a kaydedildi", Toast.LENGTH_LONG).show();
+                    shareResult(saved);
+                });
+            } catch (Throwable t) {
+                String msg = t.getMessage();
+                if (msg == null || msg.trim().isEmpty()) msg = t.getClass().getSimpleName();
+                fail("Hata: " + msg);
+            } finally {
+                if (input != null && input.exists()) input.delete();
             }
-        }).start();
+        }, "StickerYapWorker").start();
     }
 
     private double readDurationSeconds(File f) {
@@ -200,76 +227,77 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void encodeWithSizeTarget(double duration) {
-        encodeAttempt(duration, 470, 1);
+    private File encodeWithSizeTarget(File input, double duration, int strength, int edge) throws Exception {
+        int bitrate = 470;
+        File output = null;
+
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            output = new File(getCacheDir(), "sticker_" + System.currentTimeMillis() + "_" + attempt + ".webm");
+            if (output.exists()) output.delete();
+
+            FFmpegSession session = FFmpegKit.execute(buildCommand(input, output, duration, strength, edge, bitrate));
+            if (!ReturnCode.isSuccess(session.getReturnCode()) || !output.exists()) {
+                String details;
+                try {
+                    details = session.getOutput();
+                } catch (Throwable ignored) {
+                    details = null;
+                }
+                if (details == null || details.trim().isEmpty()) {
+                    details = "FFmpeg kodu: " + session.getReturnCode();
+                } else if (details.length() > 700) {
+                    details = details.substring(details.length() - 700);
+                }
+                throw new Exception(details);
+            }
+
+            long size = output.length();
+            if (size <= LIMIT_BYTES) return output;
+
+            if (attempt < 5) {
+                int shown = attempt;
+                uiStatus("Boyut ayarlanıyor… " + shown + "/5");
+                double ratio = (LIMIT_BYTES * 0.95) / (double) size;
+                bitrate = Math.max(145, (int) Math.floor(bitrate * ratio));
+                output.delete();
+            }
+        }
+
+        throw new Exception("256 KB altına inemedi.");
     }
 
-    private void encodeAttempt(double duration, int bitrateKbps, int attempt) {
-        currentOutput = new File(getCacheDir(), "sticker_" + System.currentTimeMillis() + ".webm");
-        if (currentOutput.exists()) currentOutput.delete();
-
+    private String buildCommand(File input, File output, double duration, int strength, int edge, int bitrateKbps) {
         double similarity;
-        switch (strengthSpinner.getSelectedItemPosition()) {
+        switch (strength) {
             case 0: similarity = 0.30; break;
             case 2: similarity = 0.43; break;
             default: similarity = 0.37; break;
         }
-        double blend = 0.025 + (edgeSeek.getProgress() / 100.0) * 0.045;
-        double despillMix = 0.06 + (edgeSeek.getProgress() / 100.0) * 0.16;
+
+        double blend = 0.020 + (edge / 100.0) * 0.035;
+        double despillMix = 0.04 + (edge / 100.0) * 0.12;
         double ptsFactor = duration > 2.90 ? (2.90 / duration) : 1.0;
 
         String filter = String.format(Locale.US,
                 "setpts=%.8f*PTS,fps=24," +
                 "format=rgba," +
                 "colorkey=0x00FF00:%.3f:%.3f," +
-                "despill=type=green:mix=%.3f:expand=0:red=0:green=-0.45:blue=0:brightness=0:alpha=0," +
+                "despill=type=green:mix=%.3f:expand=0:red=0:green=-0.35:blue=0:brightness=0:alpha=0," +
                 "scale=512:512:force_original_aspect_ratio=decrease:flags=lanczos," +
                 "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000," +
                 "format=yuva420p",
                 ptsFactor, similarity, blend, despillMix);
 
-        String cmd = "-y -i " + q(cachedInput.getAbsolutePath()) +
+        return "-y -hide_banner -loglevel warning -i " + q(input.getAbsolutePath()) +
                 " -an -vf " + q(filter) +
                 " -t 2.90 -c:v libvpx-vp9 -pix_fmt yuva420p" +
-                " -deadline good -cpu-used 6 -row-mt 1 -threads 4 -auto-alt-ref 0" +
-                " -b:v " + bitrateKbps + "k -maxrate " + bitrateKbps + "k -bufsize " + (bitrateKbps * 2) + "k" +
-                " -metadata:s:v:0 alpha_mode=1 " + q(currentOutput.getAbsolutePath());
+                " -deadline good -cpu-used 6 -threads 2 -auto-alt-ref 0 -lag-in-frames 0" +
+                " -b:v " + bitrateKbps + "k" +
+                " -metadata:s:v:0 alpha_mode=1 " + q(output.getAbsolutePath());
+    }
 
-        final int usedBitrate = bitrateKbps;
-        FFmpegKit.executeAsync(cmd, session -> {
-            if (!ReturnCode.isSuccess(session.getReturnCode()) || !currentOutput.exists()) {
-                fail("Dönüştürme başarısız. FFmpeg kodu: " + session.getReturnCode());
-                return;
-            }
-
-            long size = currentOutput.length();
-            if (size <= LIMIT_BYTES) {
-                try {
-                    Uri saved = saveToDownloads(currentOutput);
-                    runOnUiThread(() -> {
-                        progress.setVisibility(View.GONE);
-                        convertButton.setEnabled(true);
-                        status.setText(String.format(Locale.US, "Hazır: %.1f KB • %d kbps", size / 1024.0, usedBitrate));
-                        Toast.makeText(this, "Downloads/StickerYap'a kaydedildi", Toast.LENGTH_LONG).show();
-                        shareResult(saved);
-                    });
-                } catch (Exception e) {
-                    fail("Kaydetme hatası: " + e.getMessage());
-                }
-                return;
-            }
-
-            if (attempt >= 5) {
-                fail("256 KB altına inemedi. Daha sert yeşil temizleme seçip tekrar dene.");
-                return;
-            }
-
-            double ratio = (LIMIT_BYTES * 0.96) / (double) size;
-            int next = Math.max(150, (int) Math.floor(usedBitrate * ratio));
-            runOnUiThread(() -> status.setText("Boyut ayarlanıyor… " + attempt + "/5"));
-            currentOutput.delete();
-            encodeAttempt(duration, next, attempt + 1);
-        });
+    private void uiStatus(String value) {
+        runOnUiThread(() -> status.setText(value));
     }
 
     private void copyUriToFile(Uri uri, File dst) throws Exception {
@@ -292,24 +320,30 @@ public class MainActivity extends Activity {
             values.put(MediaStore.Downloads.MIME_TYPE, "video/webm");
             values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/StickerYap");
             values.put(MediaStore.Downloads.IS_PENDING, 1);
+
             Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
             if (uri == null) throw new Exception("Downloads kaydı açılamadı");
-            try (InputStream in = new FileInputStream(src); OutputStream out = resolver.openOutputStream(uri)) {
+
+            try (InputStream in = new FileInputStream(src);
+                 OutputStream out = resolver.openOutputStream(uri)) {
                 if (out == null) throw new Exception("Çıktı dosyası açılamadı");
                 byte[] buf = new byte[1024 * 256];
                 int n;
                 while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
             }
+
             ContentValues done = new ContentValues();
             done.put(MediaStore.Downloads.IS_PENDING, 0);
             resolver.update(uri, done, null, null);
             return uri;
         }
 
-        File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
-        if (!dir.exists()) dir.mkdirs();
+        File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "StickerYap");
+        if (!dir.exists() && !dir.mkdirs()) throw new Exception("StickerYap klasörü oluşturulamadı");
         File outFile = new File(dir, name);
-        try (InputStream in = new FileInputStream(src); OutputStream out = new FileOutputStream(outFile)) {
+
+        try (InputStream in = new FileInputStream(src);
+             OutputStream out = new FileOutputStream(outFile)) {
             byte[] buf = new byte[1024 * 256];
             int n;
             while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
